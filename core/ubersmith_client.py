@@ -13,7 +13,7 @@ class UbersmithAPIError(RuntimeError):
 
 
 class UbersmithClient:
-    DEFAULT_PAGE_SIZE = 50
+    DEFAULT_PAGE_SIZE = 1000
     MIN_PAGE_SIZE = 5
     REQUEST_TIMEOUT = 60
 
@@ -29,6 +29,30 @@ class UbersmithClient:
     def get(self, method, params=None):
         """Una sola petición GET. No muta el dict de params del caller."""
         return self._request(method, params)
+
+    def post(self, method, params=None):
+        """Una sola petición POST (creación de tickets y otras escrituras)."""
+        return self._request(method, params, http_method="POST")
+
+    def submit_ticket(self, *, client_id, subject, body, queue, service_id=None, extra=None):
+        params = {
+            "subject": subject,
+            "body": body,
+            "client_id": client_id,
+            "queue": queue,
+            "internal_ticket": os.getenv("CONNEX_INTERNAL_TICKET", "1"),
+            "no_notification": os.getenv("CONNEX_NO_NOTIFICATION", "1"),
+            "priority": os.getenv("CONNEX_TICKET_PRIORITY", "1"),
+        }
+        author = os.getenv("CONNEX_TICKET_AUTHOR")
+        if author:
+            params["author"] = author
+        if service_id:
+            params["service_id"] = service_id
+        if extra:
+            params.update(extra)
+        payload = self.post("support.ticket_submit", params)
+        return str(payload.get("data") or "")
 
     def get_paginated(self, method, params=None, page_size=None):
         """
@@ -99,17 +123,26 @@ class UbersmithClient:
         page_params["offset"] = offset
         return self._request(method, page_params)
 
-    def _request(self, method, params=None):
+    def _request(self, method, params=None, http_method="GET"):
         query = dict(params or {})
         query["method"] = method
+        auth = HTTPBasicAuth(self.user, self.token)
 
         try:
-            response = requests.get(
-                self.base_url,
-                auth=HTTPBasicAuth(self.user, self.token),
-                params=query,
-                timeout=self.REQUEST_TIMEOUT,
-            )
+            if http_method == "POST":
+                response = requests.post(
+                    self.base_url,
+                    auth=auth,
+                    data=query,
+                    timeout=self.REQUEST_TIMEOUT,
+                )
+            else:
+                response = requests.get(
+                    self.base_url,
+                    auth=auth,
+                    params=query,
+                    timeout=self.REQUEST_TIMEOUT,
+                )
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
             raise UbersmithAPIError(f"Fallo de red en {method}: {exc}") from exc
         except requests.exceptions.ChunkedEncodingError as exc:
@@ -152,7 +185,13 @@ class UbersmithClient:
             normalized = {}
             for index, item in enumerate(data):
                 if isinstance(item, dict):
-                    key = item.get("clientid") or item.get("invid") or item.get("comment_id") or index
+                    key = (
+                        item.get("clientid")
+                        or item.get("invid")
+                        or item.get("comment_id")
+                        or item.get("ticket_id")
+                        or index
+                    )
                 else:
                     key = index
                 normalized[str(key)] = item

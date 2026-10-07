@@ -1,89 +1,59 @@
 import argparse
 import json
 import logging
+import os
+import time
 
 from dotenv import load_dotenv
 
 from core.bot import ConnexBot
 
 
-def main():
-    load_dotenv()
-    parser = argparse.ArgumentParser(description="ConnexMonitor dry-run (solo GET)")
-    parser.add_argument("--max-clients", type=int, default=None, help="Limita el escaneo para pruebas")
-    parser.add_argument("--client-id", action="append", dest="client_ids", help="Procesa solo estos client_id")
-    args = parser.parse_args()
-
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    bot = ConnexBot()
-
-    if args.client_ids:
-        summary = {
-            "clients_scanned": 0,
-            "with_contract": 0,
-            "disconnected": 0,
-            "overdue_beyond_grace": 0,
-            "reconnect_candidates": 0,
-            "actions": [],
-        }
-        for client_id in args.client_ids:
-            detail = bot.client.get("client.get", params={"client_id": client_id})
-            client_data = detail.get("data") or {"clientid": client_id}
-            comments = bot._list_comments(client_id)
-            profile = bot._analyze_comments(comments)
-            summary["clients_scanned"] += 1
-            if profile["has_contract"]:
-                summary["with_contract"] += 1
-            if profile["is_disconnected"]:
-                summary["disconnected"] += 1
-                action = bot.handle_disconnected_client(
-                    client_id,
-                    disconnect_comment=profile["disconnect_comment"],
-                )
-            else:
-                invoices = bot.check_unpaid_invoices(client_id)
-                action = bot.handle_overdue_client(
-                    client_id,
-                    profile["has_contract"],
-                    invoices.get("oldest_due"),
-                    invoices=invoices,
-                )
-            if action:
-                summary["actions"].append(action)
-                if action.get("type") == "disconnect":
-                    summary["overdue_beyond_grace"] += 1
-                elif action.get("type") == "reconnect":
-                    summary["reconnect_candidates"] += 1
-            print(
-                json.dumps(
-                    {
-                        "client_id": str(client_id),
-                        "has_contract": profile["has_contract"],
-                        "is_disconnected": profile["is_disconnected"],
-                        "contract_comment": (profile["contract_comment"] or "")[:180],
-                        "disconnect_comment": (profile["disconnect_comment"] or "")[:180],
-                        "action_type": action.get("type") if action else None,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
-        print("\n=== RESUMEN ===")
-        print(json.dumps({k: v for k, v in summary.items() if k != "actions"}, indent=2))
-        print(f"Acciones (dry-run, sin POST): {len(summary['actions'])}")
-        return
-
-    summary = bot.process_clients(max_clients=args.max_clients)
+def _print_summary(summary):
     printable = dict(summary)
     printable["actions"] = [
         {
             "type": action.get("type"),
             "client_id": action.get("client_id"),
-            "subject": (action.get("ticket") or {}).get("subject"),
+            "ticket_id": action.get("ticket_id"),
+            "queue": action.get("queue"),
+            "service_id": action.get("service_id"),
+            "reason": action.get("reason"),
+            "dry_run": action.get("dry_run"),
         }
-        for action in summary["actions"]
+        for action in summary.get("actions", [])
     ]
     print(json.dumps(printable, indent=2, ensure_ascii=False, default=str))
+
+
+def main():
+    load_dotenv()
+    parser = argparse.ArgumentParser(description="ConnexMonitor: comenta, decide y solicita en cola")
+    parser.add_argument("--once", action="store_true", help="Ejecuta un solo ciclo y termina")
+    parser.add_argument("--max-clients", type=int, default=None, help="Limita el escaneo para pruebas")
+    parser.add_argument("--client-id", action="append", dest="client_ids", help="Procesa solo estos client_id")
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=None,
+        help="Segundos entre ciclos (default: CONNEX_INTERVAL_SECONDS o 3600)",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    bot = ConnexBot()
+    interval = args.interval if args.interval is not None else int(os.getenv("CONNEX_INTERVAL_SECONDS", "3600"))
+
+    cycle = 1
+    while True:
+        logging.info("Inicio de ciclo %s", cycle)
+        summary = bot.process_clients(max_clients=args.max_clients, client_ids=args.client_ids)
+        _print_summary(summary)
+        if args.once:
+            return
+        logging.info("Esperando %s segundos hasta el próximo ciclo", interval)
+        time.sleep(interval)
+        cycle += 1
 
 
 if __name__ == "__main__":
