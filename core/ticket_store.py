@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import uuid
 from datetime import datetime, timezone
 
 import redis
@@ -12,6 +13,20 @@ HISTORY_KEY = "connex:history:{client_id}"
 ANALYSIS_KEY = "connex:analysis:{fingerprint}"
 LOCK_KEY = "connex:cycle_lock"
 HISTORY_LIMIT = 20
+
+# Solo el dueño del candado (mismo token) puede renovarlo o liberarlo.
+REFRESH_LOCK_SCRIPT = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('expire', KEYS[1], ARGV[2])
+end
+return 0
+"""
+RELEASE_LOCK_SCRIPT = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+end
+return 0
+"""
 
 
 def _utcnow():
@@ -97,10 +112,18 @@ class TicketStore:
         )
 
     def acquire_lock(self, ttl_seconds):
-        return bool(self.client.set(LOCK_KEY, "1", nx=True, ex=max(60, int(ttl_seconds))))
+        token = uuid.uuid4().hex
+        if self.client.set(LOCK_KEY, token, nx=True, ex=max(60, int(ttl_seconds))):
+            return token
+        return None
 
-    def release_lock(self):
-        self.client.delete(LOCK_KEY)
+    def refresh_lock(self, token, ttl_seconds):
+        return bool(
+            self.client.eval(REFRESH_LOCK_SCRIPT, 1, LOCK_KEY, token, max(60, int(ttl_seconds)))
+        )
+
+    def release_lock(self, token):
+        self.client.eval(RELEASE_LOCK_SCRIPT, 1, LOCK_KEY, token)
 
 
 def _parse_iso(value):

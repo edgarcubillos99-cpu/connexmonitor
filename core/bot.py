@@ -2,7 +2,8 @@ import hashlib
 import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
@@ -13,13 +14,15 @@ from core.ubersmith_client import UbersmithClient
 logger = logging.getLogger(__name__)
 
 BUSINESS_TZ = ZoneInfo("America/Puerto_Rico")
+CONTRACT_GRACE_DAYS = 61
+SERVICE_STATUS = {"1": "active", "2": "pending", "3": "suspended", "4": "cancelled"}
 ACTION_LABELS = {
     "disconnect": "Desconexión de servicios",
     "reconnect": "Reconexión de servicios",
 }
 ACTION_SUBJECT_HINTS = {
-    "disconnect": ("desconex", "disconnect", "corte"),
-    "reconnect": ("reconex", "reconnect"),
+    "disconnect": ("desconex", "desconect", "disconnect", "corte"),
+    "reconnect": ("reconex", "reconect", "reconnect"),
 }
 
 
@@ -47,6 +50,29 @@ def _stable_hash(payload):
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def apply_business_rules(analysis, invoices, balance, today):
+    """
+    Reglas duras que la IA no puede saltarse. Devuelve (acción, motivo_si_se_anula).
+
+    - Sin contrato: si ya pasó el due_date, toca desconexión. No hay días de gracia.
+    - Con contrato: máximo 61 días de atraso desde el due_date más antiguo.
+    """
+    action = analysis.get("action") or "none"
+    if action == "disconnect":
+        overdue = [item for item in invoices if item["due_date"] and item["due_date"] < today]
+        if not overdue or balance <= 0:
+            return "none", "sin_facturas_vencidas"
+        if analysis.get("has_contract"):
+            oldest_due = min(item["due_date"] for item in overdue)
+            deadline = oldest_due + timedelta(days=CONTRACT_GRACE_DAYS)
+            if today <= deadline:
+                return "none", f"prorroga_contrato_hasta_{deadline.isoformat()}"
+    elif action == "reconnect":
+        if balance > 0 and invoices:
+            return "none", "deuda_pendiente"
+    return action, None
+
+
 class ConnexBot:
     def __init__(self, client=None, store=None, analyzer=None):
         self.client = client or UbersmithClient()
@@ -57,7 +83,8 @@ class ConnexBot:
         self.comment_limit = int(os.getenv("CONNEX_COMMENT_LIMIT", "25"))
         self.comment_max_chars = int(os.getenv("CONNEX_COMMENT_MAX_CHARS", "400"))
         self.cooldown_hours = float(os.getenv("CONNEX_COOLDOWN_HOURS", "72"))
-        self.analysis_ttl = int(os.getenv("CONNEX_ANALYSIS_TTL_SECONDS", "604800"))
+        self.analysis_ttl = int(os.getenv("CONNEX_ANALYSIS_TTL_SECONDS", "86400"))
+        self.lock_ttl = int(os.getenv("CONNEX_LOCK_TTL_SECONDS", "1800"))
         self.default_queue = os.getenv("SUPPORT_QUEUE_ID", "57")
         self.queues = {
             "disconnect": os.getenv("CONNEX_QUEUE_DISCONNECT") or self.default_queue,
@@ -69,6 +96,7 @@ class ConnexBot:
             for item in os.getenv("CONNEX_OPEN_TICKET_TYPES", "Open,On Hold").split(",")
             if item.strip()
         ]
+        self.concurrency = max(1, int(os.getenv("CONNEX_CONCURRENCY", "8")))
 
     def process_clients(self, max_clients=None, client_ids=None):
         """
@@ -90,47 +118,49 @@ class ConnexBot:
             "actions": [],
         }
 
-        lock_ttl = int(os.getenv("CONNEX_LOCK_TTL_SECONDS", "1800"))
-        if not self.store.acquire_lock(lock_ttl):
+        lock_token = self.store.acquire_lock(self.lock_ttl)
+        if not lock_token:
             logger.warning("Hay otro ciclo en curso; se omite este para evitar reprocesar.")
             summary["skipped_locked"] = True
             return summary
 
         try:
-            return self._process_clients_locked(summary, max_clients, client_ids)
+            return self._process_clients_locked(summary, max_clients, client_ids, lock_token)
         finally:
-            self.store.release_lock()
+            self.store.release_lock(lock_token)
 
-    def _process_clients_locked(self, summary, max_clients, client_ids):
+    def _process_clients_locked(self, summary, max_clients, client_ids, lock_token):
         clients = self._load_clients(client_ids)
-        logger.info("Clientes a revisar: %s", len(clients))
+        items = list(clients.items())
+        if max_clients is not None:
+            items = items[: max(0, max_clients)]
+        workers = min(self.concurrency, len(items)) or 1
+        logger.info("Clientes a revisar: %s (concurrencia=%s)", len(items), workers)
 
-        for client_id, client_data in clients.items():
-            if max_clients is not None and summary["clients_scanned"] >= max_clients:
-                break
-            summary["clients_scanned"] += 1
-            try:
-                result = self._process_one(client_id, client_data)
-            except Exception:
-                logger.exception("Error procesando cliente %s", client_id)
-                summary["errors"] += 1
-                continue
+        if not items:
+            return summary
 
-            if not result:
-                continue
-            if result.get("status") == "created":
-                summary["tickets_created"] += 1
-                summary["analyzed"] += 1
-                summary["actions"].append(result)
-            elif result.get("status") == "duplicate":
-                summary["skipped_duplicate"] += 1
-                summary["analyzed"] += 1
-            elif result.get("status") == "open_ticket":
-                summary["skipped_open_ticket"] += 1
-                summary["analyzed"] += 1
-            elif result.get("status") == "none":
-                summary["skipped_none"] += 1
-                summary["analyzed"] += 1
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(self._process_one, client_id, client_data): client_id
+                for client_id, client_data in items
+            }
+            for future in as_completed(futures):
+                client_id = futures[future]
+                if not self.store.refresh_lock(lock_token, self.lock_ttl):
+                    logger.error("Se perdió el candado del ciclo; se espera a los hilos en curso y se corta.")
+                    summary["lock_lost"] = True
+                    for pending in futures:
+                        pending.cancel()
+                    break
+                summary["clients_scanned"] += 1
+                try:
+                    result = future.result()
+                except Exception:
+                    logger.exception("Error procesando cliente %s", client_id)
+                    summary["errors"] += 1
+                    continue
+                self._record_result(summary, result)
 
         logger.info(
             "Ciclo terminado: scanned=%s created=%s duplicados=%s abiertos=%s none=%s errors=%s dry_run=%s",
@@ -144,25 +174,49 @@ class ConnexBot:
         )
         return summary
 
+    @staticmethod
+    def _record_result(summary, result):
+        if not result:
+            return
+        status = result.get("status")
+        if status == "created":
+            summary["tickets_created"] += 1
+            summary["analyzed"] += 1
+            summary["actions"].append(result)
+        elif status == "duplicate":
+            summary["skipped_duplicate"] += 1
+            summary["analyzed"] += 1
+        elif status == "open_ticket":
+            summary["skipped_open_ticket"] += 1
+            summary["analyzed"] += 1
+        elif status == "none":
+            summary["skipped_none"] += 1
+            summary["analyzed"] += 1
+
     def _process_one(self, client_id, client_data):
+        today = datetime.now(BUSINESS_TZ).date()
         comments = self._list_comments(client_id)
         services = self._list_services(client_id)
+        invoices = self._list_unpaid_invoices(client_id, today)
         balance = _parse_money(
             client_data.get("balance")
             if client_data.get("balance") not in (None, "")
             else client_data.get("inv_balance")
         )
-        balance_bucket = "zero" if balance == 0 else "debt"
+        balance_bucket = "zero" if balance <= 0 else "debt"
         service_status_hash = _stable_hash(
             [(item["service_id"], item.get("status"), item.get("suspended")) for item in services]
         )
         comment_payload = self._comments_for_model(comments)
         comments_hash = _stable_hash(comment_payload)
+        # El día forma parte de la huella: promesas de pago y prórrogas vencen con el tiempo.
         analysis_fingerprint = _stable_hash(
             {
                 "comments": comments_hash,
                 "balance": balance_bucket,
                 "services": service_status_hash,
+                "invoices": [(item["invid"], item["due_date"], item["amount_unpaid"]) for item in invoices],
+                "day": today.isoformat(),
             }
         )
 
@@ -172,16 +226,25 @@ class ConnexBot:
                 client_id,
                 comments=comment_payload,
                 services=services,
+                invoices=invoices,
                 balance=balance,
                 balance_bucket=balance_bucket,
+                today=today,
             )
             self.store.cache_analysis(analysis_fingerprint, analysis, self.analysis_ttl)
         else:
             logger.debug("Análisis en caché para cliente %s", client_id)
 
-        action = analysis.get("action") or "none"
+        action, override_reason = apply_business_rules(analysis, invoices, balance, today)
+        if override_reason:
+            logger.info(
+                "Cliente %s: la IA pidió %s pero las reglas lo anulan (%s)",
+                client_id,
+                analysis.get("action"),
+                override_reason,
+            )
         if action == "none":
-            return {"status": "none", "client_id": str(client_id)}
+            return {"status": "none", "client_id": str(client_id), "reason": override_reason}
 
         service_id = (analysis.get("service_ids") or [None])[0]
         situation_hash = _stable_hash(
@@ -245,6 +308,8 @@ class ConnexBot:
             services=services,
             service_ids=analysis.get("service_ids") or [],
             comments=comment_payload[:5],
+            invoices=invoices,
+            has_contract=analysis.get("has_contract"),
         )
 
         if self.dry_run:
@@ -316,21 +381,28 @@ class ConnexBot:
         return payload.get("data") or {}
 
     def _list_comments(self, client_id):
-        payload = self.client.get_paginated(
+        payload = self.client.get(
             "client.comment_list",
-            params={"client_id": client_id, "direction": "desc", "order_by": "time"},
-            page_size=self.page_size,
+            params={
+                "client_id": client_id,
+                "direction": "desc",
+                "order_by": "time",
+                "limit": self.comment_limit,
+            },
         )
         comments = [
-            item for item in (payload.get("data") or {}).values() if isinstance(item, dict)
+            item
+            for item in self.client._normalize_data(payload.get("data")).values()
+            if isinstance(item, dict)
         ]
         comments.sort(key=lambda item: int(item.get("time") or 0), reverse=True)
         return comments[: self.comment_limit]
 
     def _list_services(self, client_id):
+        # pack_type_select=4: activos, pendientes y suspendidos que no han terminado.
         payload = self.client.get_paginated(
             "client.service_list",
-            params={"client_id": client_id, "pack_type_select": 3},
+            params={"client_id": client_id, "pack_type_select": 4},
             page_size=self.page_size,
         )
         services = []
@@ -340,16 +412,39 @@ class ConnexBot:
             service_id = item.get("packid") or item.get("service_id")
             if not service_id:
                 continue
+            active_code = str(item.get("active") or "")
             services.append(
                 {
                     "service_id": str(service_id),
-                    "title": item.get("title") or item.get("code") or "",
-                    "status": item.get("status") or item.get("servtype") or "",
+                    "title": (item.get("title") or item.get("code") or "").strip(),
+                    "status": SERVICE_STATUS.get(active_code, active_code),
                     "suspended": str(item.get("suspend_bool") or "0"),
-                    "active": str(item.get("active") or ""),
                 }
             )
         return services
+
+    def _list_unpaid_invoices(self, client_id, today):
+        payload = self.client.get_paginated(
+            "client.invoice_list",
+            params={"client_id": client_id, "paid": 0, "order_by": "due", "direction": "asc"},
+            page_size=self.page_size,
+        )
+        invoices = []
+        for item in (payload.get("data") or {}).values():
+            if not isinstance(item, dict) or str(item.get("paid", "0")) != "0":
+                continue
+            due_dt = _parse_unix_datetime(item.get("due"))
+            due_day = due_dt.date() if due_dt else None
+            invoices.append(
+                {
+                    "invid": str(item.get("invid") or ""),
+                    "amount_unpaid": str(_parse_money(item.get("amount_unpaid") or item.get("amount"))),
+                    "due_date": due_day,
+                    "days_overdue": max(0, (today - due_day).days) if due_day else 0,
+                }
+            )
+        invoices.sort(key=lambda item: item["due_date"] or date.max)
+        return invoices
 
     def _find_blocking_open_ticket(self, client_id, queue, action, service_id):
         """
@@ -442,7 +537,14 @@ class ConnexBot:
             )
         return prepared
 
-    def _ticket_body(self, client_id, action, reason, balance, services, service_ids, comments):
+    def _ticket_body(
+        self, client_id, action, reason, balance, services, service_ids, comments, invoices, has_contract
+    ):
+        invoice_lines = [
+            f"- Factura {item['invid']}: vence {item['due_date'] or 'sin fecha'}, "
+            f"impago {item['amount_unpaid']}, {item['days_overdue']} días de atraso"
+            for item in invoices
+        ]
         service_lines = []
         selected = set(service_ids)
         for item in services:
@@ -462,7 +564,10 @@ class ConnexBot:
             f"Acción: {action}\n"
             f"Motivo: {reason}\n"
             f"Balance: {balance}\n"
+            f"Contrato (según comentarios): {'sí' if has_contract else 'no'}\n"
             f"Servicios referidos: {', '.join(service_ids) or 'no especificado'}\n\n"
+            f"Facturas impagas:\n"
+            f"{chr(10).join(invoice_lines) or '- Sin facturas impagas'}\n\n"
             f"Servicios del cliente:\n"
             f"{chr(10).join(service_lines) or '- Sin servicios listados'}\n\n"
             f"Comentarios recientes:\n"

@@ -47,8 +47,14 @@ def main():
     cycle = 1
     while True:
         logging.info("Inicio de ciclo %s", cycle)
-        summary = bot.process_clients(max_clients=args.max_clients, client_ids=args.client_ids)
-        _print_summary(summary)
+        try:
+            summary = bot.process_clients(max_clients=args.max_clients, client_ids=args.client_ids)
+        except Exception:
+            logging.exception("El ciclo %s falló; se reintenta en el próximo ciclo", cycle)
+            if args.once:
+                raise SystemExit(1)
+        else:
+            _print_summary(summary)
         if args.once:
             return
         logging.info("Esperando %s segundos hasta el próximo ciclo", interval)
