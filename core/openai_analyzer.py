@@ -28,9 +28,7 @@ Datos que recibes:
 - balance / balance_state, services (status: active, pending, suspended) y comments (más recientes primero).
 
 Reglas de negocio:
-- Contrato: determina por los comentarios si el cliente tiene contrato vigente
-  (ej. "Contrato", "Contrato 2 años", "renovó contrato"). "Sin contrato", "no contrato"
-  o "fuera de contrato" significa que NO tiene. Si no hay evidencia, has_contract = false.
+- Contrato: se te informa en el payload si el cliente tiene contrato (has_contract).
 - Sin contrato no hay prórroga: si el due_date ya pasó, hay que pedir disconnect.
 - Con contrato, el cliente puede durar máximo 61 días de atraso desde el due_date
   de su factura impaga más antigua. Al día 62, disconnect.
@@ -39,6 +37,7 @@ Reglas de negocio:
 
 Reglas generales:
 - Basa la decisión en los comentarios, usando facturas, balance y servicios como contexto.
+- Las facturas indican a qué "service_ids" pertenecen. Úsalo para saber cuál servicio desconectar si un cliente tiene varios.
 - No inventes hechos que no estén en los datos.
 - Un comentario viejo de desconexión no justifica reconectar si el cliente ya opera normal o hay uno más reciente de reconexión.
 - Si el cliente figura desconectado y el balance ya está en cero / sin deuda, reconectar tiene sentido.
@@ -49,7 +48,6 @@ Reglas generales:
 Responde SOLO un JSON con esta forma:
 {
   "action": "disconnect" | "reconnect" | "none",
-  "has_contract": true | false,
   "reason": "motivo breve en español",
   "service_ids": ["id", "..."],
   "confidence": 0.0
@@ -73,12 +71,13 @@ class CommentAnalyzer:
         self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self.min_confidence = float(os.getenv("CONNEX_MIN_CONFIDENCE", "0.7"))
 
-    def analyze(self, client_id, comments, services, invoices, balance, balance_bucket, today):
+    def analyze(self, client_id, comments, services, invoices, balance, balance_bucket, today, has_contract):
         user_payload = {
             "client_id": str(client_id),
             "today": today.isoformat(),
             "balance": str(balance),
             "balance_state": balance_bucket,
+            "has_contract": has_contract,
             "unpaid_invoices": [
                 {
                     "invid": item["invid"],
@@ -151,7 +150,6 @@ class CommentAnalyzer:
 
         return {
             "action": action,
-            "has_contract": parsed.get("has_contract") is True,
             "reason": str(parsed.get("reason") or "").strip() or "Sin motivo",
             "service_ids": service_ids,
             "confidence": confidence,

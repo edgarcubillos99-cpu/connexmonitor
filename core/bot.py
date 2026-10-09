@@ -50,7 +50,7 @@ def _stable_hash(payload):
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def apply_business_rules(analysis, invoices, balance, today):
+def apply_business_rules(analysis, invoices, balance, today, has_contract):
     """
     Reglas duras que la IA no puede saltarse. Devuelve (acción, motivo_si_se_anula).
 
@@ -62,7 +62,7 @@ def apply_business_rules(analysis, invoices, balance, today):
         overdue = [item for item in invoices if item["due_date"] and item["due_date"] < today]
         if not overdue or balance <= 0:
             return "none", "sin_facturas_vencidas"
-        if analysis.get("has_contract"):
+        if has_contract:
             oldest_due = min(item["due_date"] for item in overdue)
             deadline = oldest_due + timedelta(days=CONTRACT_GRACE_DAYS)
             if today <= deadline:
@@ -220,6 +220,13 @@ class ConnexBot:
             }
         )
 
+        has_contract = False
+        for item in services:
+            term = str(item.get("contract_term") or "").strip().lower()
+            if term and term not in ("no contract", "none", "null", ""):
+                has_contract = True
+                break
+
         analysis = self.store.get_cached_analysis(analysis_fingerprint)
         if analysis is None:
             analysis = self.analyzer.analyze(
@@ -230,12 +237,13 @@ class ConnexBot:
                 balance=balance,
                 balance_bucket=balance_bucket,
                 today=today,
+                has_contract=has_contract,
             )
             self.store.cache_analysis(analysis_fingerprint, analysis, self.analysis_ttl)
         else:
             logger.debug("Análisis en caché para cliente %s", client_id)
 
-        action, override_reason = apply_business_rules(analysis, invoices, balance, today)
+        action, override_reason = apply_business_rules(analysis, invoices, balance, today, has_contract)
         if override_reason:
             logger.info(
                 "Cliente %s: la IA pidió %s pero las reglas lo anulan (%s)",
@@ -309,7 +317,7 @@ class ConnexBot:
             service_ids=analysis.get("service_ids") or [],
             comments=comment_payload[:5],
             invoices=invoices,
-            has_contract=analysis.get("has_contract"),
+            has_contract=has_contract,
         )
 
         if self.dry_run:
@@ -402,7 +410,7 @@ class ConnexBot:
         # pack_type_select=4: activos, pendientes y suspendidos que no han terminado.
         payload = self.client.get_paginated(
             "client.service_list",
-            params={"client_id": client_id, "pack_type_select": 4},
+            params={"client_id": client_id, "pack_type_select": 4, "metadata": 1},
             page_size=self.page_size,
         )
         services = []
@@ -412,13 +420,25 @@ class ConnexBot:
             service_id = item.get("packid") or item.get("service_id")
             if not service_id:
                 continue
+                
+            # Ignorar cargos de una sola vez (como reconexiones o facturas sueltas)
+            if str(item.get("period") or "0") == "0":
+                continue
+                
             active_code = str(item.get("active") or "")
+            
+            metadata = item.get("metadata") or {}
+            contract_term = metadata.get("contract_term")
+            if contract_term is None:
+                contract_term = item.get("contract_term")
+                
             services.append(
                 {
                     "service_id": str(service_id),
                     "title": (item.get("title") or item.get("code") or "").strip(),
                     "status": SERVICE_STATUS.get(active_code, active_code),
                     "suspended": str(item.get("suspend_bool") or "0"),
+                    "contract_term": str(contract_term) if contract_term is not None else None,
                 }
             )
         return services
@@ -435,12 +455,28 @@ class ConnexBot:
                 continue
             due_dt = _parse_unix_datetime(item.get("due"))
             due_day = due_dt.date() if due_dt else None
+            invid = str(item.get("invid") or "")
+            
+            service_ids = []
+            if invid:
+                try:
+                    inv_detail = self.client.get("client.invoice_get", {"invoice_id": invid})
+                    data = inv_detail.get("data") or {}
+                    packs = data.get("current_packs") or {}
+                    for pack in packs.values():
+                        packid = pack.get("packid")
+                        if packid:
+                            service_ids.append(str(packid))
+                except Exception as exc:
+                    logger.warning("No se pudo obtener detalle de factura %s: %s", invid, exc)
+
             invoices.append(
                 {
-                    "invid": str(item.get("invid") or ""),
+                    "invid": invid,
                     "amount_unpaid": str(_parse_money(item.get("amount_unpaid") or item.get("amount"))),
                     "due_date": due_day,
                     "days_overdue": max(0, (today - due_day).days) if due_day else 0,
+                    "service_ids": service_ids,
                 }
             )
         invoices.sort(key=lambda item: item["due_date"] or date.max)
@@ -542,7 +578,8 @@ class ConnexBot:
     ):
         invoice_lines = [
             f"- Factura {item['invid']}: vence {item['due_date'] or 'sin fecha'}, "
-            f"impago {item['amount_unpaid']}, {item['days_overdue']} días de atraso"
+            f"impago {item['amount_unpaid']}, {item['days_overdue']} días de atraso "
+            f"(Servicios: {', '.join(item.get('service_ids') or []) or 'desconocido'})"
             for item in invoices
         ]
         service_lines = []
