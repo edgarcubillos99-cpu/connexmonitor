@@ -17,7 +17,7 @@ def _print_summary(summary):
             "client_id": action.get("client_id"),
             "ticket_id": action.get("ticket_id"),
             "queue": action.get("queue"),
-            "service_id": action.get("service_id"),
+            "service_ids": action.get("service_ids"),
             "reason": action.get("reason"),
             "dry_run": action.get("dry_run"),
         }

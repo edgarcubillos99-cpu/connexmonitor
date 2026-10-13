@@ -11,6 +11,10 @@ logger = logging.getLogger(__name__)
 class UbersmithAPIError(RuntimeError):
     """Error de negocio o de transporte al consultar Ubersmith."""
 
+    def __init__(self, message, retryable=True):
+        super().__init__(message)
+        self.retryable = retryable
+
 
 class UbersmithClient:
     DEFAULT_PAGE_SIZE = 1000
@@ -72,7 +76,7 @@ class UbersmithClient:
             try:
                 payload = self._request_page(method, params, limit=limit, offset=offset)
             except UbersmithAPIError as exc:
-                if limit <= self.MIN_PAGE_SIZE:
+                if not exc.retryable or limit <= self.MIN_PAGE_SIZE:
                     raise
                 next_limit = max(self.MIN_PAGE_SIZE, limit // 2)
                 logger.warning(
@@ -156,7 +160,10 @@ class UbersmithClient:
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as exc:
-            raise UbersmithAPIError(f"HTTP {response.status_code} en {method}: {exc}") from exc
+            # 4xx (permisos, parámetros) no se arregla pidiendo páginas más chicas.
+            raise UbersmithAPIError(
+                f"HTTP {response.status_code} en {method}: {exc}", retryable=False
+            ) from exc
 
         if not response.content:
             raise UbersmithAPIError(f"Respuesta vacía en {method}")

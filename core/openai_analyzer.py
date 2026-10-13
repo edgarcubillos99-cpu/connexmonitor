@@ -7,50 +7,31 @@ from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
-VALID_ACTIONS = {"disconnect", "reconnect", "none"}
+VALID_ACTIONS = {"disconnect", "none"}
 
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 MASKED_CARD_RE = re.compile(r"\*{2,}\s*\d{4}")
 LONG_NUMBER_RE = re.compile(r"(?<!\d)\d{9,19}(?!\d)")
 PHONE_RE = re.compile(r"(?<!\d)(?:\(\d{3}\)\s*|\d{3}[-.\s])\d{3}[-.\s]\d{4}(?!\d)")
 
-SYSTEM_PROMPT = """Eres un analista de operaciones de un ISP.
-Revisas comentarios internos de Ubersmith y un resumen del cliente.
-Debes decidir UNA acción para solicitar al departamento correspondiente:
-
-- disconnect: hay que pedir desconexión del servicio.
-- reconnect: hay que pedir reconexión del servicio.
-- none: no hay que solicitar nada ahora.
+SYSTEM_PROMPT = """Eres un auditor de operaciones de un ISP.
+El sistema automático ha decidido DESCONECTAR al cliente por falta de pago.
+Tu único trabajo es revisar el historial de comentarios del cliente y buscar si un agente humano le ha otorgado una prórroga, promesa de pago o excepción que aún esté vigente para la fecha de hoy.
 
 Datos que recibes:
-- today: fecha de hoy (America/Puerto_Rico). Úsala para saber si una promesa o prórroga ya venció.
-- unpaid_invoices: facturas impagas con su fecha de vencimiento (due_date) y días de atraso.
-- balance / balance_state, services (status: active, pending, suspended) y comments (más recientes primero).
+- today: fecha de hoy (America/Puerto_Rico).
+- comments: comentarios del cliente, del más reciente al más antiguo.
 
-Reglas de negocio:
-- Contrato: se te informa en el payload si el cliente tiene contrato (has_contract).
-- Sin contrato no hay prórroga: si el due_date ya pasó, hay que pedir disconnect.
-- Con contrato, el cliente puede durar máximo 61 días de atraso desde el due_date
-  de su factura impaga más antigua. Al día 62, disconnect.
-- Nunca pidas disconnect si ninguna factura impaga está vencida.
-- Una promesa de pago documentada que aún no vence es una prórroga vigente; si ya venció, no lo es.
-
-Reglas generales:
-- Basa la decisión en los comentarios, usando facturas, balance y servicios como contexto.
-- Las facturas indican a qué "service_ids" pertenecen. Úsalo para saber cuál servicio desconectar si un cliente tiene varios.
-- No inventes hechos que no estén en los datos.
-- Un comentario viejo de desconexión no justifica reconectar si el cliente ya opera normal o hay uno más reciente de reconexión.
-- Si el cliente figura desconectado y el balance ya está en cero / sin deuda, reconectar tiene sentido.
-- Si hay mora o instrucción de cortar, y no hay prórroga clara vigente, desconectar tiene sentido.
-- Si la evidencia es ambigua o insuficiente, usa none.
-- Si mencionan un servicio concreto y está en la lista, inclúyelo en service_ids.
+Reglas:
+1. Si encuentras una prórroga o promesa de pago que vence EN EL FUTURO (después de 'today') o HOY, debes detener la desconexión.
+2. Si la prórroga ya venció en el pasado (antes de 'today'), la desconexión procede.
+3. Si no hay comentarios sobre prórrogas o excepciones, la desconexión procede.
+4. No asumas prórrogas si no hay evidencia clara en el texto.
 
 Responde SOLO un JSON con esta forma:
 {
-  "action": "disconnect" | "reconnect" | "none",
-  "reason": "motivo breve en español",
-  "service_ids": ["id", "..."],
-  "confidence": 0.0
+  "action": "none" | "disconnect",
+  "reason": "motivo por el cual detienes (none) o permites (disconnect) la desconexión"
 }
 """
 
@@ -69,25 +50,11 @@ class CommentAnalyzer:
             raise ValueError("Falta OPENAI_API_KEY en las variables de entorno.")
         self.client = OpenAI(api_key=api_key)
         self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        self.min_confidence = float(os.getenv("CONNEX_MIN_CONFIDENCE", "0.7"))
 
-    def analyze(self, client_id, comments, services, invoices, balance, balance_bucket, today, has_contract):
+    def check_extensions(self, client_id, comments, today):
         user_payload = {
             "client_id": str(client_id),
             "today": today.isoformat(),
-            "balance": str(balance),
-            "balance_state": balance_bucket,
-            "has_contract": has_contract,
-            "unpaid_invoices": [
-                {
-                    "invid": item["invid"],
-                    "amount_unpaid": item["amount_unpaid"],
-                    "due_date": item["due_date"].isoformat() if item["due_date"] else None,
-                    "days_overdue": item["days_overdue"],
-                }
-                for item in invoices
-            ],
-            "services": services,
             "comments": [
                 {**comment, "text": redact_personal_data(comment.get("text") or "")}
                 for comment in comments
@@ -119,38 +86,13 @@ class CommentAnalyzer:
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"OpenAI devolvió JSON inválido para cliente {client_id}") from exc
 
+        # Ante cualquier respuesta que no sea un "disconnect" explícito, no se corta.
         action = str(parsed.get("action") or "none").strip().lower()
         if action not in VALID_ACTIONS:
-            action = "none"
-
-        try:
-            confidence = float(parsed.get("confidence", 0))
-        except (TypeError, ValueError):
-            confidence = 0.0
-
-        service_ids = []
-        raw_services = parsed.get("service_ids") or []
-        if isinstance(raw_services, (str, int)):
-            raw_services = [raw_services]
-        known = {str(item.get("service_id")) for item in services if item.get("service_id")}
-        for item in raw_services:
-            service_id = str(item).strip()
-            if service_id and service_id in known:
-                service_ids.append(service_id)
-
-        if action != "none" and confidence < self.min_confidence:
-            logger.info(
-                "Cliente %s: OpenAI dijo %s con confianza %.2f < %.2f; se ignora",
-                client_id,
-                action,
-                confidence,
-                self.min_confidence,
-            )
+            logger.warning("Cliente %s: OpenAI respondió acción inválida %r; no se corta", client_id, action)
             action = "none"
 
         return {
             "action": action,
             "reason": str(parsed.get("reason") or "").strip() or "Sin motivo",
-            "service_ids": service_ids,
-            "confidence": confidence,
         }
