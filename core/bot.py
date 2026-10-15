@@ -4,7 +4,6 @@ import logging
 import os
 import re
 import threading
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -12,10 +11,13 @@ from zoneinfo import ZoneInfo
 
 from core.openai_analyzer import CommentAnalyzer
 from core.ticket_store import (
+    SOURCE_BASELINE,
     STATE_ACTIVE,
     STATE_DISCONNECT_REQUESTED,
     STATE_DISCONNECTED,
     STATE_RECONNECT_REQUESTED,
+    STATUS_CONNECTED,
+    STATUS_DISCONNECTED,
     TicketStore,
 )
 from core.ubersmith_client import UbersmithAPIError, UbersmithClient
@@ -25,8 +27,6 @@ logger = logging.getLogger(__name__)
 BUSINESS_TZ = ZoneInfo("America/Puerto_Rico")
 OVERDUE_INVOICES_WITH_CONTRACT = 2
 OVERDUE_INVOICES_WITHOUT_CONTRACT = 1
-# Leftovers crónicos: más de N facturas vencidas del mismo circuito no se cortan.
-MAX_OVERDUE_INVOICES = 5
 # Campo "active" del servicio en Ubersmith: 1 activo, 2 pendiente, 3 suspendido, 4 cancelado.
 EVALUABLE_SERVICE_CODES = {"1", "2", "3"}
 SUSPENDED_SERVICE_CODE = "3"
@@ -42,21 +42,21 @@ CLOSED_TICKET_STATUS = "3"
 DELETED_TICKET_STATUS = "4"
 ACTION_LABELS = {
     "disconnect": "Desconexión de servicios",
-    "reconnect": "Reconexión de servicios",
 }
+# "reconnect" no se pide aquí; se deja para no tratar tickets de reconexión
+# (otro servicio, misma cola) como si bloquearan un corte.
 ACTION_SUBJECT_HINTS = {
     "disconnect": ("desconex", "desconect", "disconnect", "corte"),
     "reconnect": ("reconex", "reconect", "reconnect"),
 }
 REQUESTED_STATE = {
     "disconnect": STATE_DISCONNECT_REQUESTED,
-    "reconnect": STATE_RECONNECT_REQUESTED,
 }
 REQUESTED_ACTION = {state: action for action, state in REQUESTED_STATE.items()}
-# Transición cuando el ticket pedido termina: (cerrado completo, cerrado incompleto o borrado).
+# Transición cuando el ticket de corte termina: (cerrado completo, cerrado incompleto o borrado).
+# reconnect_requested lo resuelve el servicio de reconexiones.
 TICKET_OUTCOME = {
     STATE_DISCONNECT_REQUESTED: (STATE_DISCONNECTED, STATE_ACTIVE),
-    STATE_RECONNECT_REQUESTED: (STATE_ACTIVE, STATE_DISCONNECTED),
 }
 
 
@@ -107,28 +107,6 @@ def _as_items(value):
     return []
 
 
-def load_ignored_service_ids(path=None):
-    """Lee ignored_services.json: lista o {"service_ids": [...]}."""
-    raw_path = path or os.getenv("CONNEX_IGNORED_SERVICES_PATH", "ignored_services.json")
-    file_path = Path(raw_path)
-    if not file_path.is_absolute():
-        file_path = Path(__file__).resolve().parent.parent / file_path
-    if not file_path.is_file():
-        return set()
-    payload = json.loads(file_path.read_text())
-    if isinstance(payload, dict):
-        ids = payload.get("service_ids") or []
-    elif isinstance(payload, list):
-        ids = payload
-    else:
-        return set()
-    return {str(item).strip() for item in ids if str(item).strip()}
-
-
-def is_ignored_service(service, ignored_ids):
-    return str(service.get("service_id") or "") in ignored_ids
-
-
 def is_fiberx_service(service):
     """
     FiberX y OSNet conviven en el mismo Ubersmith.
@@ -168,13 +146,11 @@ def circuit_state(service, circuits):
     return STATE_ACTIVE
 
 
-def decide_actions(services, circuits, overdue_by_service, has_contract, max_overdue=MAX_OVERDUE_INVOICES):
+def decide_actions(services, circuits, overdue_by_service, has_contract):
     """
-    Reglas por circuito:
+    Reglas de corte por circuito:
     - activo con >= 2 facturas vencidas (con contrato) o >= 1 (sin contrato): desconectar.
-    - más de max_overdue vencidas: leftover crónico, no se toca.
-    - desconectado sin facturas vencidas de ese servicio: reconectar.
-    - con una solicitud en curso: no se hace nada hasta que el ticket termine.
+    - desconectado, solicitado o en reconexión: no se toca (lo lleva el otro servicio).
     """
     threshold = OVERDUE_INVOICES_WITH_CONTRACT if has_contract else OVERDUE_INVOICES_WITHOUT_CONTRACT
     decisions = []
@@ -182,8 +158,6 @@ def decide_actions(services, circuits, overdue_by_service, has_contract, max_ove
         service_id = service["service_id"]
         state = circuit_state(service, circuits)
         overdue = len(overdue_by_service.get(service_id, []))
-        if max_overdue is not None and overdue > max_overdue:
-            continue
         if state == STATE_ACTIVE and overdue >= threshold:
             decisions.append(
                 {
@@ -193,14 +167,6 @@ def decide_actions(services, circuits, overdue_by_service, has_contract, max_ove
                         f"{overdue} facturas vencidas "
                         f"({'con' if has_contract else 'sin'} contrato, límite {threshold})"
                     ),
-                }
-            )
-        elif state == STATE_DISCONNECTED and overdue == 0:
-            decisions.append(
-                {
-                    "service_id": service_id,
-                    "action": "reconnect",
-                    "reason": "sin facturas vencidas del servicio",
                 }
             )
     return decisions
@@ -240,32 +206,36 @@ class ConnexBot:
         self.default_queue = os.getenv("SUPPORT_QUEUE_ID", "57")
         self.queues = {
             "disconnect": os.getenv("CONNEX_QUEUE_DISCONNECT") or self.default_queue,
-            "reconnect": os.getenv("CONNEX_QUEUE_RECONNECT") or self.default_queue,
         }
         self.open_ticket_max_age_days = float(os.getenv("CONNEX_OPEN_TICKET_MAX_AGE_DAYS", "5"))
-        self.max_overdue_invoices = int(os.getenv("CONNEX_MAX_OVERDUE_INVOICES", str(MAX_OVERDUE_INVOICES)))
         self.concurrency = max(1, int(os.getenv("CONNEX_CONCURRENCY", "8")))
-        self.ignored_service_ids = load_ignored_service_ids()
         self._ticket_types = {}
         self._ticket_types_lock = threading.Lock()
-        if self.ignored_service_ids:
-            logger.info("Servicios en lista de ignore: %s", len(self.ignored_service_ids))
+        self._baseline_pending = set()
+        self._clients_with_pending_disconnect = set()
 
     def process_clients(self, max_clients=None, client_ids=None):
         """
         Por cada cliente:
-        1. Actualiza el estado de sus circuitos según los tickets pedidos antes.
-        2. Reglas en Python deciden desconectar o reconectar cada circuito.
+        1. Actualiza el estado de sus circuitos según los tickets de corte pedidos antes.
+        2. Reglas en Python deciden si hay que desconectar cada circuito activo.
         3. OpenAI solo revisa prórrogas antes de un corte.
         4. No se postea si ya hay un ticket abierto reciente del circuito en la cola.
-        5. Se crea el ticket y el circuito queda "solicitado" en Redis hasta que se cierre.
+        5. Se crea el ticket y el circuito queda "disconnect_requested" en MySQL hasta que se cierre.
+
+        Primer ciclo (base vacía): línea base. Cada cliente se revisa una vez sin
+        tickets ni IA, y lo que ya pasa el límite queda guardado como desconectado.
+        Después solo se pide corte si aparece mora nueva. Las reconexiones las
+        hace otro servicio leyendo los mismos circuitos en MySQL.
+
+        En cada cliente se actualiza connex_services (conectado/desconectado)
+        con todos los circuitos evaluables que Ubersmith tenga en ese momento.
         """
         summary = {
             "clients_scanned": 0,
             "clients_without_debt": 0,
             "services_overdue": 0,
             "disconnect_candidates": 0,
-            "reconnect_candidates": 0,
             "openai_calls": 0,
             "openai_cache_hits": 0,
             "disconnects_blocked_by_ai": 0,
@@ -274,6 +244,8 @@ class ConnexBot:
             "skipped_extension": 0,
             "skipped_recently_failed": 0,
             "circuits_updated": 0,
+            "baseline_clients": 0,
+            "baseline_marked": 0,
             "errors": 0,
             "dry_run": self.dry_run,
             "actions": [],
@@ -292,7 +264,21 @@ class ConnexBot:
             self.store.release_lock(lock_token)
 
     def _process_clients_locked(self, summary, max_clients, client_ids, lock_token):
+        self.store.purge_expired()
         clients = self._load_clients(client_ids)
+        if not self.store.baseline_started():
+            everyone = self._list_active_clients() if client_ids else clients
+            self.store.start_baseline(everyone.keys())
+            logger.info(
+                "Primer ciclo: línea base para %s clientes; no se crearán tickets para ellos",
+                len(everyone),
+            )
+        self._baseline_pending = self.store.baseline_pending_ids()
+        self._clients_with_pending_disconnect = self.store.clients_with_states(
+            (STATE_DISCONNECT_REQUESTED,)
+        )
+        if self._baseline_pending:
+            logger.info("Clientes pendientes de línea base: %s", len(self._baseline_pending))
         items = list(clients.items())
         if max_clients is not None:
             items = items[: max(0, max_clients)]
@@ -329,15 +315,17 @@ class ConnexBot:
                 self._record_result(summary, result)
 
         logger.info(
-            "Ciclo terminado: scanned=%s mora=%s corte=%s reconexion=%s ia=%s "
-            "ia_rechazo=%s created=%s errors=%s dry_run=%s",
+            "Ciclo terminado: scanned=%s mora=%s corte=%s ia=%s "
+            "ia_rechazo=%s created=%s linea_base_clientes=%s linea_base_desconectados=%s "
+            "errors=%s dry_run=%s",
             summary["clients_scanned"],
             summary["services_overdue"],
             summary["disconnect_candidates"],
-            summary["reconnect_candidates"],
             summary["openai_calls"],
             summary["disconnects_blocked_by_ai"],
             summary["tickets_created"],
+            summary["baseline_clients"],
+            summary["baseline_marked"],
             summary["errors"],
             self.dry_run,
         )
@@ -347,11 +335,13 @@ class ConnexBot:
     def _record_result(summary, result):
         if result.get("without_debt"):
             summary["clients_without_debt"] += 1
+        if result.get("baseline"):
+            summary["baseline_clients"] += 1
         for key in (
+            "baseline_marked",
             "circuits_updated",
             "services_overdue",
             "disconnect_candidates",
-            "reconnect_candidates",
             "openai_calls",
             "openai_cache_hits",
             "disconnects_blocked_by_ai",
@@ -372,33 +362,60 @@ class ConnexBot:
 
     def _process_one(self, client_id, client_data):
         client_id = str(client_id)
+        baseline = client_id in self._baseline_pending
+        result = self._evaluate_client(client_id, client_data, baseline)
+        # Si hubo error el cliente queda pendiente y su línea base se hace en el próximo ciclo.
+        if baseline:
+            self.store.finish_client_baseline(client_id)
+            result["baseline"] = True
+        return result
+
+    def _evaluate_client(self, client_id, client_data, baseline):
         result = {
             "client_id": client_id,
             "events": [],
             "circuits_updated": 0,
             "services_overdue": 0,
             "disconnect_candidates": 0,
-            "reconnect_candidates": 0,
             "openai_calls": 0,
             "openai_cache_hits": 0,
             "disconnects_blocked_by_ai": 0,
+            "baseline_marked": 0,
             "disconnect_report": [],
         }
+        try:
+            return self._evaluate_client_body(client_id, client_data, baseline, result)
+        finally:
+            listed = result.pop("_services", None)
+            if listed is not None:
+                self._sync_service_registry(client_id, listed)
+
+    def _evaluate_client_body(self, client_id, client_data, baseline, result):
         balance = self._client_balance(client_data)
 
-        # Sin deuda y sin circuitos cortados o pedidos: no hay nada que decidir.
-        if balance is not None and balance <= 0 and not self.store.client_has_circuits(client_id):
+        # Sin deuda y sin corte pedido: no hay ticket que decidir, pero sí hay
+        # que refrescar el inventario de servicios (conectado/desconectado).
+        if (
+            balance is not None
+            and balance <= 0
+            and client_id not in self._clients_with_pending_disconnect
+        ):
+            _, result_services = self._list_services(client_id)
+            self._bind_services(result, result_services)
             result["without_debt"] = True
             return result
 
         today = datetime.now(BUSINESS_TZ).date()
         circuits = self.store.get_client_circuits(client_id)
         invoices = self._list_overdue_invoices(client_id, today)
-        # Debe, pero nada vencido todavía y ningún circuito que vigilar.
-        if not invoices and not circuits:
+        recurring, services = self._list_services(client_id)
+        self._bind_services(result, services)
+        # Debe, pero nada vencido todavía y ningún corte pedido que sincronizar.
+        if not invoices and not any(
+            record.get("state") == STATE_DISCONNECT_REQUESTED for record in circuits.values()
+        ):
             return result
 
-        recurring, services = self._list_services(client_id)
         has_contract = self._client_has_contract(client_id, recurring)
         circuits, updated = self._sync_circuits(client_id, circuits, services)
         result["circuits_updated"] = updated
@@ -406,44 +423,44 @@ class ConnexBot:
         service_ids = {service["service_id"] for service in services}
         overdue_by_service, unattributed = group_overdue_by_service(invoices, service_ids, today)
         result["services_overdue"] = len(overdue_by_service)
-        decisions = decide_actions(
-            services,
-            circuits,
-            overdue_by_service,
-            has_contract,
-            max_overdue=self.max_overdue_invoices,
-        )
+        decisions = decide_actions(services, circuits, overdue_by_service, has_contract)
         disconnects = [item for item in decisions if item["action"] == "disconnect"]
-        reconnects = [item for item in decisions if item["action"] == "reconnect"]
-        result["disconnect_candidates"] = len(disconnects)
-        result["reconnect_candidates"] = len(reconnects)
-        titles = {service["service_id"]: service.get("title") or "" for service in services}
-        if not decisions:
+        services_by_id = {service["service_id"]: service for service in services}
+
+        if baseline:
+            marked_at = datetime.now(timezone.utc).isoformat()
+            for item in disconnects:
+                self.store.set_circuit(
+                    client_id,
+                    item["service_id"],
+                    STATE_DISCONNECTED,
+                    cid=services_by_id[item["service_id"]].get("cid"),
+                    previous_state=STATE_ACTIVE,
+                    reason=item["reason"],
+                    requested_at=marked_at,
+                    source=SOURCE_BASELINE,
+                )
+            result["baseline_marked"] = len(disconnects)
+            if disconnects:
+                logger.info(
+                    "Cliente %s: línea base, %s servicios guardados como desconectados",
+                    client_id,
+                    len(disconnects),
+                )
             return result
 
-        comment_payload = []
-        blocked_by_ai = False
-        if disconnects:
-            comment_payload = self._comments_for_model(self._list_comments(client_id))
-            extension, ia_source = self._check_extension(client_id, comment_payload, today)
-            if ia_source == "openai":
-                result["openai_calls"] = 1
-            elif ia_source == "cache":
-                result["openai_cache_hits"] = 1
-            if extension:
-                blocked_by_ai = True
-                logger.info("Cliente %s: corte detenido por prórroga: %s", client_id, extension)
-                result["disconnects_blocked_by_ai"] = len(disconnects)
-                for item in disconnects:
-                    result["events"].append(
-                        {
-                            "status": "extension",
-                            "client_id": client_id,
-                            "service_ids": [item["service_id"]],
-                            "reason": extension,
-                        }
-                    )
-                decisions = reconnects
+        result["disconnect_candidates"] = len(disconnects)
+        titles = {service["service_id"]: service.get("title") or "" for service in services}
+        if not disconnects:
+            return result
+
+        comment_payload = self._comments_for_model(self._list_comments(client_id))
+        extension, ia_source = self._check_extension(client_id, comment_payload, today)
+        if ia_source == "openai":
+            result["openai_calls"] = 1
+        elif ia_source == "cache":
+            result["openai_cache_hits"] = 1
+        blocked_by_ai = bool(extension)
         result["disconnect_report"] = [
             {
                 "client_id": client_id,
@@ -455,32 +472,53 @@ class ConnexBot:
             }
             for item in disconnects
         ]
-
-        services_by_id = {service["service_id"]: service for service in services}
-        for action in ("disconnect", "reconnect"):
-            group = [item for item in decisions if item["action"] == action]
-            if not group:
-                continue
-            invoices = {}
-            for item in group:
-                for invoice in overdue_by_service.get(item["service_id"], []):
-                    invoices[invoice["invid"]] = invoice
-            for invoice in unattributed:
-                invoices[invoice["invid"]] = invoice
-            result["events"].extend(
-                self._request_action(
-                    client_id=client_id,
-                    action=action,
-                    decisions=group,
-                    services_by_id=services_by_id,
-                    circuits=circuits,
-                    balance=balance,
-                    invoices=sorted(invoices.values(), key=lambda item: item["due_date"]),
-                    comments=comment_payload[:5],
-                    has_contract=has_contract,
+        if extension:
+            logger.info("Cliente %s: corte detenido por prórroga: %s", client_id, extension)
+            result["disconnects_blocked_by_ai"] = len(disconnects)
+            for item in disconnects:
+                result["events"].append(
+                    {
+                        "status": "extension",
+                        "client_id": client_id,
+                        "service_ids": [item["service_id"]],
+                        "reason": extension,
+                    }
                 )
+            return result
+
+        invoices_for_ticket = {}
+        for item in disconnects:
+            for invoice in overdue_by_service.get(item["service_id"], []):
+                invoices_for_ticket[invoice["invid"]] = invoice
+        for invoice in unattributed:
+            invoices_for_ticket[invoice["invid"]] = invoice
+        result["events"].extend(
+            self._request_action(
+                client_id=client_id,
+                action="disconnect",
+                decisions=disconnects,
+                services_by_id=services_by_id,
+                circuits=circuits,
+                balance=balance,
+                invoices=sorted(invoices_for_ticket.values(), key=lambda item: item["due_date"]),
+                comments=comment_payload[:5],
+                has_contract=has_contract,
             )
+        )
         return result
+
+    @staticmethod
+    def _bind_services(result, services):
+        result["_services"] = services
+
+    def _sync_service_registry(self, client_id, services):
+        circuits = self.store.get_client_circuits(client_id)
+        rows = []
+        for service in services:
+            state = circuit_state(service, circuits)
+            estado = STATUS_DISCONNECTED if state != STATE_ACTIVE else STATUS_CONNECTED
+            rows.append((service["service_id"], estado))
+        self.store.sync_client_services(client_id, rows)
 
     def _request_action(
         self, client_id, action, decisions, services_by_id, circuits, balance, invoices, comments, has_contract
@@ -639,14 +677,18 @@ class ConnexBot:
 
     def _sync_circuits(self, client_id, circuits, services):
         """
-        Mueve los circuitos "solicitados" según el ticket: cerrado = hecho;
+        Mueve los circuitos "disconnect_requested" según el ticket: cerrado = hecho;
         cerrado incompleto o borrado = vuelve al estado anterior.
+        reconnect_requested lo deja el servicio de reconexiones.
         """
         service_ids = {service["service_id"] for service in services}
         current = {}
         updated = 0
         outcomes = {}
         for service_id, record in circuits.items():
+            if record.get("state") == STATE_RECONNECT_REQUESTED:
+                current[service_id] = record
+                continue
             if service_id not in service_ids:
                 # El servicio se canceló o terminó: ya no es un circuito a vigilar.
                 self.store.delete_circuit(client_id, service_id)
@@ -849,7 +891,6 @@ class ConnexBot:
                 status_code in EVALUABLE_SERVICE_CODES
                 and not (end_ts and end_ts < now_ts)
                 and not is_fiberx_service(service)
-                and not is_ignored_service(service, self.ignored_service_ids)
             ):
                 evaluable.append(service)
         return recurring, evaluable
@@ -1027,7 +1068,7 @@ class ConnexBot:
             f"Acción: {action}\n"
             f"Balance: {balance if balance is not None else 'N/D'}\n"
             f"Contrato: {'sí' if has_contract else 'no'}\n\n"
-            f"Servicios a {'desconectar' if action == 'disconnect' else 'reconectar'}:\n"
+            f"Servicios a desconectar:\n"
             f"{chr(10).join(target_lines)}\n\n"
             f"Facturas vencidas:\n"
             f"{chr(10).join(invoice_lines) or '- Ninguna'}\n\n"
