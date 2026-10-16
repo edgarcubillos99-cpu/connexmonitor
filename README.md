@@ -44,8 +44,8 @@ ConnexMonitor/
 │   ├── ubersmith_client.py    # Cliente HTTP para la API 2.0 de Ubersmith con paginación adaptativa
 │   ├── ticket_store.py        # Capa de almacenamiento y caché sobre Redis (candados, circuitos, estados)
 │   └── openai_analyzer.py     # Anonimizador de PII y auditor semántico de comentarios con OpenAI
-├── ignored_services.json      # Lista negra de IDs de servicios excluidos de evaluación
-├── docker-compose.yml         # Contenedor de Redis listo para producción/desarrollo
+├── Dockerfile                 # Imagen del bot (Python 3.12)
+├── docker-compose.yml         # Imagen del bot; MySQL es un servidor remoto
 ├── requirements.txt           # Dependencias de Python
 ├── run_bot.py                 # Script de entrada para ejecución continua o en modo manual
 ├── .env.example               # Plantilla de variables de entorno con valores recomendados
@@ -59,7 +59,7 @@ ConnexMonitor/
 | [`run_bot.py`](file:///home/edgar/Proyectos/python/ConnexMonitor/run_bot.py) | Maneja argumentos de línea de comandos (`--once`, `--max-clients`, etc.), bucle de tiempo y logging inicial. |
 | [`core/bot.py`](file:///home/edgar/Proyectos/python/ConnexMonitor/core/bot.py) | Clase principal `ConnexBot`. Coordina la concurrencia (`ThreadPoolExecutor`), sincronización de circuitos, reglas financieras y ensamblado de tickets. |
 | [`core/ubersmith_client.py`](file:///home/edgar/Proyectos/python/ConnexMonitor/core/ubersmith_client.py) | Gestiona peticiones GET/POST seguras hacia Ubersmith. Si Ubersmith falla por payloads muy pesados, reduce dinámicamente el tamaño de página (`limit`). |
-| [`core/ticket_store.py`](file:///home/edgar/Proyectos/python/ConnexMonitor/core/ticket_store.py) | Clase `TicketStore`. Interfaz con Redis para registrar estados de circuitos, histórico de solicitudes, caché de facturas y candados distribuidos seguros con Lua. |
+| [`core/ticket_store.py`](file:///home/edgar/Proyectos/python/ConnexMonitor/core/ticket_store.py) | Clase `TicketStore`. Persistencia en el MySQL remoto: circuitos, contratos, caché, candado de ciclo e inventario `connex_services`. |
 | [`core/openai_analyzer.py`](file:///home/edgar/Proyectos/python/ConnexMonitor/core/openai_analyzer.py) | Clase `CommentAnalyzer`. Enmascara datos sensibles (PII) mediante Regex y consulta al modelo de lenguaje si procede o no la desconexión. |
 | [`ignored_services.json`](file:///home/edgar/Proyectos/python/ConnexMonitor/ignored_services.json) | Archivo JSON con una lista de `service_ids` que el bot jamás tocará (ej. cuentas institucionales, pruebas o casos especiales). |
 
@@ -266,30 +266,35 @@ Cuando se crea un ticket vía `support.ticket_submit`, se envían los siguientes
 ## 🚀 Instalación y Puesta en Marcha
 
 ### 1. Prerrequisitos
-* Python 3.10 o superior.
-* Docker y Docker Compose (para levantar la instancia local de Redis).
+* Docker y Docker Compose.
+* MySQL remoto alcanzable desde el host Docker (puerto 3306 o el que configures).
 * Acceso de red y credenciales a la API de Ubersmith.
 * Llave de API de OpenAI válida.
 
-### 2. Clonar el repositorio y crear entorno virtual
+### 2. Configurar el entorno
 ```bash
 git clone <url-del-repositorio>
 cd ConnexMonitor
+cp .env.example .env
+```
+Completa Ubersmith, OpenAI y el MySQL **remoto** (`MYSQL_HOST`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE`). Dentro del contenedor, `localhost` es el propio bot: usa el hostname o la IP del servidor de base de datos. Si MySQL está en la misma máquina que Docker, usa `host.docker.internal`.
 
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+El usuario de MySQL debe poder crear la base `MYSQL_DATABASE` si aún no existe (o créala tú antes). Las tablas `connex_*` las crea el bot al conectar.
+
+### 3. Levantar el bot
+```bash
+docker compose up -d --build
+```
+Eso construye la imagen, espera a que el MySQL remoto responda e inicia `run_bot.py` en ciclo continuo. Dry-run sigue activo salvo `CONNEX_DRY_RUN=0`.
+
+```bash
+docker compose ps
+docker compose logs -f bot
 ```
 
-### 3. Iniciar el servicio de Redis
-El proyecto incluye un archivo `docker-compose.yml` preconfigurado con persistencia append-only:
+Un solo ciclo (cron / prueba):
 ```bash
-docker compose up -d
-```
-Para verificar que Redis responde:
-```bash
-docker compose exec redis redis-cli ping
-# Debe responder: PONG
+docker compose run --rm bot python run_bot.py --once --max-clients 10
 ```
 
 ---

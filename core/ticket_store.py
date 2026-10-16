@@ -162,10 +162,13 @@ class TicketStore:
         self.database = os.getenv("MYSQL_DATABASE", "connexmonitor").strip()
         if not DATABASE_NAME_RE.match(self.database):
             raise ValueError("MYSQL_DATABASE solo admite letras, números y _ (máx. 64)")
-        host = os.getenv("MYSQL_HOST")
-        user = os.getenv("MYSQL_USER")
+        host = (os.getenv("MYSQL_HOST") or "").strip()
+        user = (os.getenv("MYSQL_USER") or "").strip()
         if not host or not user:
             raise ValueError("Faltan MYSQL_HOST y MYSQL_USER en las variables de entorno.")
+        if host in {"localhost", "127.0.0.1", "::1"} and os.path.exists("/.dockerenv"):
+            host = "host.docker.internal"
+            logger.warning("MYSQL_HOST=localhost no sirve en Docker; se usa host.docker.internal")
         self._params = {
             "host": host,
             "port": int(os.getenv("MYSQL_PORT", "3306")),

@@ -1,0 +1,23 @@
+services:
+  bot:
+    build: .
+    image: connexmonitor-bot
+    container_name: connexmonitor-bot
+    # MySQL es remoto: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD,
+    # MYSQL_DATABASE y opcionalmente MYSQL_SSL_CA salen de .env.
+    env_file:
+      - .env
+    environment:
+      CONNEX_DRY_RUN: ${CONNEX_DRY_RUN:-1}
+    # Permite MYSQL_HOST=host.docker.internal si la base corre en el mismo servidor que Docker.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Para TLS: copia el CA a ./certs y usa MYSQL_SSL_CA=/certs/ca.pem en .env.
+    # volumes:
+    #   - ./certs:/certs:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    restart: unless-stopped
