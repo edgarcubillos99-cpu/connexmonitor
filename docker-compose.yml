@@ -9,6 +9,11 @@ services:
       - .env
     environment:
       TZ: America/Puerto_Rico
+      # Una ejecución al día (America/Puerto_Rico). Sobrescribible desde .env.
+      CONNEX_DAILY_AT: ${CONNEX_DAILY_AT:-02:00}
+      # Solo lunes a jueves; viernes, sábado y domingo no corre.
+      CONNEX_RUN_DAYS: ${CONNEX_RUN_DAYS:-mon,tue,wed,thu}
+      CONNEX_RUN_ON_START: ${CONNEX_RUN_ON_START:-0}
       CONNEX_DRY_RUN: ${CONNEX_DRY_RUN:-1}
     # Permite MYSQL_HOST=host.docker.internal si la base corre en el mismo servidor que Docker.
     extra_hosts:
