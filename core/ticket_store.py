@@ -37,6 +37,7 @@ BASELINE_META_KEY = "baseline_started_at"
 CIRCUIT_FIELDS = ("cid", "ticket_id", "queue", "previous_state", "reason", "requested_at", "source")
 DATABASE_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 UNKNOWN_DATABASE = 1049
+DUPLICATE_KEY_NAME = 1061
 # Conexión caída o cerrada por el servidor remoto: se reabre y se reintenta una vez.
 RECONNECT_ERRORS = {0, 2006, 2013, 2014, 2055}
 
@@ -258,8 +259,12 @@ class TicketStore:
         existing = {(row["t"], row["i"]) for row in rows or []}
         for table, name, columns in INDEXES:
             if (table, name) not in existing:
-                self._execute(f"ALTER TABLE {table} ADD INDEX {name} ({columns})")
-                logger.info("Índice %s creado en %s", name, table)
+                try:
+                    self._execute(f"ALTER TABLE {table} ADD INDEX {name} ({columns})")
+                    logger.info("Índice %s creado en %s", name, table)
+                except pymysql.err.OperationalError as exc:
+                    if exc.args[0] != DUPLICATE_KEY_NAME:
+                        raise
         self._execute(
             "INSERT IGNORE INTO connex_lock (name, token, expires_at) VALUES (%s, '', %s)",
             (LOCK_NAME, _utc_naive()),

@@ -8,6 +8,7 @@ services:
     env_file:
       - .env
     environment:
+      TZ: America/Puerto_Rico
       CONNEX_DRY_RUN: ${CONNEX_DRY_RUN:-1}
     # Permite MYSQL_HOST=host.docker.internal si la base corre en el mismo servidor que Docker.
     extra_hosts:
